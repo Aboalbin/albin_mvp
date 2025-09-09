@@ -1,10 +1,11 @@
 streamlit>=1.33
-pandas>=2.1
-numpy>=1.23,<2.0
-scikit-learn>=1.2,<1.5
-geopy>=2.3
+pandas>=2.2.3
+numpy>=2.1.0,<2.4
+scikit-learn>=1.6,<1.7
+scipy>=1.14.1
+geopy>=2.4
 folium>=0.15
 streamlit-folium>=0.18
 openpyxl>=3.1
-pyproj>=3.5
 tqdm>=4.66
+pyproj>=3.6
