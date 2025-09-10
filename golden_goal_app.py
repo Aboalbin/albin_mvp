@@ -25,7 +25,8 @@ from streamlit_folium import st_folium
 # ---------- Hjälpare (koordinater) ----------
 
 # --- Koordinat-hjälp (ersätt hela blocket från SWEDEN_BBOX till enrich_coords_for_map) ---
-SWEDEN_BBOX = (55.0, 10.0, 69.5, 25.5)  # lat_min, lon_min, lat_max, lon_max
+# --- Koordinat-hjälp (säker rad-vis fix + snällare Sverige-bbox) ---
+SWEDEN_BBOX = (54.5, 8.0, 70.5, 32.0)  # lat_min, lon_min, lat_max, lon_max
 
 def _in_sweden(lat, lon):
     lat = pd.to_numeric(lat, errors="coerce")
@@ -34,25 +35,25 @@ def _in_sweden(lat, lon):
 
 def _maybe_fix_coordinates_inplace(df: pd.DataFrame, label: str = "companies"):
     """
-    Säker fix per rad:
-      1) Byt plats på rader där (lat≈10–25 & lon≈55–70) → uppenbart omkastat.
-      2) Konvertera ENDAST rader som ser ut som meter (SWEREF 99 TM, EPSG:3006) till WGS84.
-      3) Värden utanför Sverige → sätt NaN (så kan vi geokoda just de raderna).
+    Gör fix per rad, inte på hela tabellen:
+      1) Byt lat/lon där mönstret (lat≈10–25 & lon≈55–70) tyder på omkastning.
+      2) Konvertera ENDAST rader som ser ut som meter (EPSG:3006) till WGS84.
+      3) Sätt INTE allt utanför Sverige till NaN här; vi försöker geokoda först.
     """
     if "latitude" not in df.columns or "longitude" not in df.columns:
         return
 
-    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
 
     # 1) Byt plats på uppenbart omkastade rader
     mask_swap = df["latitude"].between(10, 25) & df["longitude"].between(55, 70)
     if mask_swap.any():
         tmp = df.loc[mask_swap, "latitude"].copy()
-        df.loc[mask_swap, "latitude"] = df.loc[mask_swap, "longitude"]
+        df.loc[mask_swap, "latitude"]  = df.loc[mask_swap, "longitude"]
         df.loc[mask_swap, "longitude"] = tmp
 
-    # 2) Konvertera endast rader som ser ut att vara i meter
+    # 2) Konvertera bara rader som ser ut att vara i meter
     mask_m = (df["latitude"].abs() > 90) | (df["longitude"].abs() > 180)
     if mask_m.any():
         try:
@@ -61,19 +62,14 @@ def _maybe_fix_coordinates_inplace(df: pd.DataFrame, label: str = "companies"):
             x = df.loc[mask_m, "longitude"].astype(float).values  # Easting
             y = df.loc[mask_m, "latitude"].astype(float).values   # Northing
             lon2, lat2 = transformer.transform(x, y)
-            df.loc[mask_m, "latitude"] = lat2
+            df.loc[mask_m, "latitude"]  = lat2
             df.loc[mask_m, "longitude"] = lon2
         except Exception:
             pass
 
-    # 3) Allt som fortfarande hamnar utanför Sverige → NaN (så geokodar vi just dem)
-    bad = ~_in_sweden(df["latitude"], df["longitude"])
-    if bad.any():
-        df.loc[bad, ["latitude", "longitude"]] = np.nan
-
 @st.cache_data(show_spinner=False)
 def geocode_company(name: str, district: str | None = None):
-    """Geokodar enstaka bolag för kartan när koordinater saknas/är orimliga."""
+    """Geokodar enstaka bolag när koordinater saknas/är orimliga (för kartan)."""
     try:
         g = Nominatim(user_agent="golden_goal_app/companies", timeout=8)
         q = ", ".join([p for p in [name, district, "Sweden"] if p])
@@ -84,31 +80,48 @@ def geocode_company(name: str, district: str | None = None):
         pass
     return None, None
 
-def enrich_coords_for_map(df_results: pd.DataFrame, max_fix: int = 15) -> pd.DataFrame:
+def enrich_coords_for_map(df_results: pd.DataFrame, max_fix: int = 50) -> tuple[pd.DataFrame, dict]:
     """
-    För kartan: försök automatiskt rätta typiska fel (swap/meter) och geokoda
-    HÖGST 'max_fix' rader som saknar koordinater efter fix.
+    1) Försök rad-vis swap / meter->WGS84.
+    2) Geokoda upp till max_fix rader som saknar koordinater ELLER ligger utanför Sverige.
+    3) Returnera (plot_df, debug_info) där plot_df bara innehåller rader inne i Sverige.
     """
     df = df_results.copy()
+    dbg = {"n_in": len(df), "geocoded": 0, "after_fix_inside": 0}
+
     if "latitude" not in df.columns or "longitude" not in df.columns:
-        return df
+        return df, dbg
 
     _maybe_fix_coordinates_inplace(df)
 
     lat = pd.to_numeric(df["latitude"], errors="coerce")
     lon = pd.to_numeric(df["longitude"], errors="coerce")
-    bad = lat.isna() | lon.isna()
+    inside = _in_sweden(lat, lon)
+    dbg["after_fix_inside"] = int(inside.sum())
 
-    # Geokoda bara de rader som saknar koordinater efter fixen
-    for idx in list(df.index[bad])[:max_fix]:
+    # Kandidater att förbättra: saknar coord eller ligger utanför Sverige
+    bad = (~inside) | lat.isna() | lon.isna()
+    to_fix = list(df.index[bad])[:max_fix]
+    for idx in to_fix:
         name = str(df.at[idx, "name"])
         district = str(df.at[idx, "district"]) if "district" in df.columns and pd.notna(df.at[idx, "district"]) else None
         glat, glon = geocode_company(name, district)
         if glat is not None and glon is not None:
-            df.at[idx, "latitude"] = glat
+            df.at[idx, "latitude"]  = glat
             df.at[idx, "longitude"] = glon
+            dbg["geocoded"] += 1
 
-    return df
+    # Efter geokodning: ta bara med de som faktiskt hamnar i Sverige på kartan
+    plot_mask = _in_sweden(df["latitude"], df["longitude"])
+    plot_df = df[plot_mask].copy()
+
+    # Om vi fortfarande har för få punkter: visa ändå upp till 2 reservpunkter (utan att sabotera zoom)
+    if len(plot_df) < 3:
+        extras = df[~plot_mask].head(2)
+        plot_df = pd.concat([plot_df, extras], ignore_index=True)
+
+    return plot_df, dbg
+
 
 
 # ---------- Hjälpare (text & parsing) ----------
