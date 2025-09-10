@@ -24,49 +24,56 @@ from streamlit_folium import st_folium
 
 # ---------- Hjälpare (koordinater) ----------
 
+# --- Koordinat-hjälp (ersätt hela blocket från SWEDEN_BBOX till enrich_coords_for_map) ---
 SWEDEN_BBOX = (55.0, 10.0, 69.5, 25.5)  # lat_min, lon_min, lat_max, lon_max
 
-def _in_sweden(lat_s: pd.Series, lon_s: pd.Series) -> pd.Series:
-    return lat_s.between(SWEDEN_BBOX[0], SWEDEN_BBOX[2]) & lon_s.between(SWEDEN_BBOX[1], SWEDEN_BBOX[3])
+def _in_sweden(lat, lon):
+    lat = pd.to_numeric(lat, errors="coerce")
+    lon = pd.to_numeric(lon, errors="coerce")
+    return lat.between(SWEDEN_BBOX[0], SWEDEN_BBOX[2]) & lon.between(SWEDEN_BBOX[1], SWEDEN_BBOX[3])
 
-def _looks_swapped(lat_s: pd.Series, lon_s: pd.Series) -> bool:
-    # Om "lat" ligger kring 10–25 och "lon" kring 55–70 är de troligen omkastade
-    return lat_s.between(10, 25).mean() > 0.7 and lon_s.between(55, 70).mean() > 0.7
-
-def _maybe_fix_coordinates_inplace(df: pd.DataFrame):
-    """Försök rätta koordinater: swap + SWEREF 99 TM -> WGS84."""
+def _maybe_fix_coordinates_inplace(df: pd.DataFrame, label: str = "companies"):
+    """
+    Säker fix per rad:
+      1) Byt plats på rader där (lat≈10–25 & lon≈55–70) → uppenbart omkastat.
+      2) Konvertera ENDAST rader som ser ut som meter (SWEREF 99 TM, EPSG:3006) till WGS84.
+      3) Värden utanför Sverige → sätt NaN (så kan vi geokoda just de raderna).
+    """
     if "latitude" not in df.columns or "longitude" not in df.columns:
         return
-    df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
+
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
 
-    lat, lon = df["latitude"], df["longitude"]
+    # 1) Byt plats på uppenbart omkastade rader
+    mask_swap = df["latitude"].between(10, 25) & df["longitude"].between(55, 70)
+    if mask_swap.any():
+        tmp = df.loc[mask_swap, "latitude"].copy()
+        df.loc[mask_swap, "latitude"] = df.loc[mask_swap, "longitude"]
+        df.loc[mask_swap, "longitude"] = tmp
 
-    # 1) Omsvängda axlar?
-    if _looks_swapped(lat, lon):
-        tmp = lat.copy()
-        df["latitude"] = lon
-        df["longitude"] = tmp
-        lat, lon = df["latitude"], df["longitude"]
-
-    # 2) Meterkoordinater? (stora värden tyder på projektion)
-    looks_like_meters = (lat.abs().max() > 90) or (lon.abs().max() > 180)
-    if looks_like_meters:
+    # 2) Konvertera endast rader som ser ut att vara i meter
+    mask_m = (df["latitude"].abs() > 90) | (df["longitude"].abs() > 180)
+    if mask_m.any():
         try:
             from pyproj import Transformer
-            transformer = Transformer.from_crs(3006, 4326, always_xy=True)  # SWEREF 99 TM -> WGS84
-            mask = lat.notna() & lon.notna()
-            x = df.loc[mask, "longitude"].astype(float).values
-            y = df.loc[mask, "latitude"].astype(float).values
+            transformer = Transformer.from_crs(3006, 4326, always_xy=True)  # (E,N) -> (lon,lat)
+            x = df.loc[mask_m, "longitude"].astype(float).values  # Easting
+            y = df.loc[mask_m, "latitude"].astype(float).values   # Northing
             lon2, lat2 = transformer.transform(x, y)
-            df.loc[mask, "latitude"] = lat2
-            df.loc[mask, "longitude"] = lon2
+            df.loc[mask_m, "latitude"] = lat2
+            df.loc[mask_m, "longitude"] = lon2
         except Exception:
             pass
 
+    # 3) Allt som fortfarande hamnar utanför Sverige → NaN (så geokodar vi just dem)
+    bad = ~_in_sweden(df["latitude"], df["longitude"])
+    if bad.any():
+        df.loc[bad, ["latitude", "longitude"]] = np.nan
+
 @st.cache_data(show_spinner=False)
 def geocode_company(name: str, district: str | None = None):
-    """Enkel geokod för kartan när koordinater saknas/är orimliga."""
+    """Geokodar enstaka bolag för kartan när koordinater saknas/är orimliga."""
     try:
         g = Nominatim(user_agent="golden_goal_app/companies", timeout=8)
         q = ", ".join([p for p in [name, district, "Sweden"] if p])
@@ -78,25 +85,31 @@ def geocode_company(name: str, district: str | None = None):
     return None, None
 
 def enrich_coords_for_map(df_results: pd.DataFrame, max_fix: int = 15) -> pd.DataFrame:
-    """Fixar upp till max_fix rader med saknade/utanför-Sverige-koordinater via geokodning (enbart för kartan)."""
+    """
+    För kartan: försök automatiskt rätta typiska fel (swap/meter) och geokoda
+    HÖGST 'max_fix' rader som saknar koordinater efter fix.
+    """
     df = df_results.copy()
     if "latitude" not in df.columns or "longitude" not in df.columns:
         return df
+
     _maybe_fix_coordinates_inplace(df)
 
     lat = pd.to_numeric(df["latitude"], errors="coerce")
     lon = pd.to_numeric(df["longitude"], errors="coerce")
-    bad = lat.isna() | lon.isna() | (~_in_sweden(lat, lon))
+    bad = lat.isna() | lon.isna()
 
-    to_fix = list(df.index[bad])[:max_fix]
-    for idx in to_fix:
+    # Geokoda bara de rader som saknar koordinater efter fixen
+    for idx in list(df.index[bad])[:max_fix]:
         name = str(df.at[idx, "name"])
         district = str(df.at[idx, "district"]) if "district" in df.columns and pd.notna(df.at[idx, "district"]) else None
         glat, glon = geocode_company(name, district)
         if glat is not None and glon is not None:
             df.at[idx, "latitude"] = glat
             df.at[idx, "longitude"] = glon
+
     return df
+
 
 # ---------- Hjälpare (text & parsing) ----------
 
