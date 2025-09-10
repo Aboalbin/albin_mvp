@@ -69,22 +69,34 @@ def _maybe_fix_coordinates_inplace(df: pd.DataFrame, label: str = "companies"):
 
 @st.cache_data(show_spinner=False)
 def geocode_company(name: str, district: str | None = None):
-    """Geokodar enstaka bolag när koordinater saknas/är orimliga (för kartan)."""
+    """Geokodar enstaka bolag när koordinater saknas/är orimliga – begränsad till Sverige."""
     try:
         g = Nominatim(user_agent="golden_goal_app/companies", timeout=8)
         q = ", ".join([p for p in [name, district, "Sweden"] if p])
-        loc = g.geocode(q, exactly_one=True, country_codes="se", addressdetails=False)
+
+        # Begränsa sökningen till Sverige (viewbox + bounded)
+        viewbox = ((SWEDEN_BBOX[1], SWEDEN_BBOX[0]), (SWEDEN_BBOX[3], SWEDEN_BBOX[2]))  # (min_lon,min_lat),(max_lon,max_lat)
+        loc = g.geocode(
+            q,
+            exactly_one=True,
+            country_codes="se",
+            addressdetails=False,
+            viewbox=viewbox,
+            bounded=True
+        )
         if loc:
-            return float(loc.latitude), float(loc.longitude)
+            lat, lon = float(loc.latitude), float(loc.longitude)
+            if _in_sweden(pd.Series([lat]), pd.Series([lon])).iloc[0]:
+                return lat, lon
     except Exception:
         pass
     return None, None
 
-def enrich_coords_for_map(df_results: pd.DataFrame, max_fix: int = 50) -> tuple[pd.DataFrame, dict]:
+
+def enrich_coords_for_map(df_results: pd.DataFrame, max_fix: int = 60) -> tuple[pd.DataFrame, dict]:
     """
-    1) Försök rad-vis swap / meter->WGS84.
-    2) Geokoda upp till max_fix rader som saknar koordinater ELLER ligger utanför Sverige.
-    3) Returnera (plot_df, debug_info) där plot_df bara innehåller rader inne i Sverige.
+    Fixar koordinater radvis (swap/meter->WGS84) och geokodar upp till max_fix rader.
+    Returnerar ENDAST rader som ligger i Sverige. Inga extras.
     """
     df = df_results.copy()
     dbg = {"n_in": len(df), "geocoded": 0, "after_fix_inside": 0}
@@ -99,7 +111,7 @@ def enrich_coords_for_map(df_results: pd.DataFrame, max_fix: int = 50) -> tuple[
     inside = _in_sweden(lat, lon)
     dbg["after_fix_inside"] = int(inside.sum())
 
-    # Kandidater att förbättra: saknar coord eller ligger utanför Sverige
+    # Försök förbättra bara “dåliga” rader
     bad = (~inside) | lat.isna() | lon.isna()
     to_fix = list(df.index[bad])[:max_fix]
     for idx in to_fix:
@@ -111,16 +123,11 @@ def enrich_coords_for_map(df_results: pd.DataFrame, max_fix: int = 50) -> tuple[
             df.at[idx, "longitude"] = glon
             dbg["geocoded"] += 1
 
-    # Efter geokodning: ta bara med de som faktiskt hamnar i Sverige på kartan
+    # Visa endast punkter i Sverige på kartan
     plot_mask = _in_sweden(df["latitude"], df["longitude"])
     plot_df = df[plot_mask].copy()
-
-    # Om vi fortfarande har för få punkter: visa ändå upp till 2 reservpunkter (utan att sabotera zoom)
-    if len(plot_df) < 3:
-        extras = df[~plot_mask].head(2)
-        plot_df = pd.concat([plot_df, extras], ignore_index=True)
-
     return plot_df, dbg
+
 
 
 
@@ -657,6 +664,7 @@ with right:
             map_df, dbg = enrich_coords_for_map(raw, max_fix=max(3*int(st.session_state.get("gg_topk", 10)), 60))
             if show_debug:
                 st.caption(f"Kartfix: in={dbg['n_in']}, inside_after_fix={dbg['after_fix_inside']}, geokodade={dbg['geocoded']}, plot={len(map_df)}")
+
 
         cluster = MarkerCluster().add_to(m)
         for _, r in map_df.iterrows():
