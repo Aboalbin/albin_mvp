@@ -652,11 +652,11 @@ with right:
         ).add_to(m)
         points.append([assoc_info["lat"], assoc_info["lon"]])
 
-    if raw is not None and len(raw) > 0:
-        try:
-            map_df = enrich_coords_for_map(raw, max_fix=15)
-        except NameError:
-            map_df = raw
+    # Lägg företagsmarkörer (med klustring) – förbättra koordinater för visning
+        if raw is not None and len(raw) > 0:
+            map_df, dbg = enrich_coords_for_map(raw, max_fix=max(3*int(st.session_state.get("gg_topk", 10)), 60))
+            if show_debug:
+                st.caption(f"Kartfix: in={dbg['n_in']}, inside_after_fix={dbg['after_fix_inside']}, geokodade={dbg['geocoded']}, plot={len(map_df)}")
 
         cluster = MarkerCluster().add_to(m)
         for _, r in map_df.iterrows():
